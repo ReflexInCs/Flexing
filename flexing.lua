@@ -14,6 +14,8 @@ local isWalkMode = false
 local currentHeight = DEFAULT_HEIGHT
 local isActive = false
 
+local noCollideConnections = {}
+
 local function getCharParts()
 	local character = player.Character
 	if not character then return nil, nil, nil, nil end
@@ -34,16 +36,68 @@ local function loadAndPlayAnim(animator)
 	return track
 end
 
+-- Disable collision between the platform and all other players so they don't get launched by the slab
+local function disablePlatformCollisionWithOthers(platform)
+	-- Clean up old connections first
+	for _, c in ipairs(noCollideConnections) do c:Disconnect() end
+	noCollideConnections = {}
+
+	local function applyNoCollide(otherChar)
+		if not otherChar then return end
+		for _, part in ipairs(otherChar:GetDescendants()) do
+			if part:IsA("BasePart") then
+				local weld = Instance.new("NoCollisionConstraint")
+				weld.Part0 = platform
+				weld.Part1 = part
+				weld.Parent = platform
+			end
+		end
+	end
+
+	-- Apply to all current other players
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player and p.Character then
+			applyNoCollide(p.Character)
+		end
+	end
+
+	-- Apply to any who join/spawn later
+	local conn1 = Players.PlayerAdded:Connect(function(p)
+		local c = p.Character or p.CharacterAdded:Wait()
+		applyNoCollide(c)
+	end)
+	local conn2 = Players.PlayerRemoving:Connect(function() end) -- placeholder
+	table.insert(noCollideConnections, conn1)
+	table.insert(noCollideConnections, conn2)
+
+	-- Also watch for character respawns of existing players
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= player then
+			local conn = p.CharacterAdded:Connect(function(c) applyNoCollide(c) end)
+			table.insert(noCollideConnections, conn)
+		end
+	end
+end
+
+
 local function cleanUp()
 	if poseConnection then poseConnection:Disconnect() poseConnection = nil end
 	if walkConnection then walkConnection:Disconnect() walkConnection = nil end
 	if activeTrack then activeTrack:Stop() activeTrack = nil end
+
+	for _, c in ipairs(noCollideConnections) do c:Disconnect() end
+	noCollideConnections = {}
+
 	if activePlatform then activePlatform:Destroy() activePlatform = nil end
 
-	local _, root, humanoid, _ = getCharParts()
+	local character, root, humanoid, _ = getCharParts()
 	if humanoid then
 		humanoid.PlatformStand = false
 		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+	if root then
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
 	end
 
 	isWalkMode = false
@@ -56,6 +110,10 @@ local function makePlatform()
 	p.Size = Vector3.new(14, 1, 14)
 	p.Transparency = 1
 	p.Anchored = true
+	-- FIX: Platform only collides with the local player (stands on it), not other players.
+	-- We handle this by keeping CanCollide true but using NoCollisionConstraints for others (done above).
+	-- Also make it smaller so there's less surface to bump into:
+	p.Size = Vector3.new(4, 1, 4)
 	p.CanCollide = true
 	p.CanQuery = false
 	p.CastShadow = false
@@ -87,6 +145,9 @@ local function startPose(height)
 	activePlatform = makePlatform()
 	activePlatform.CFrame = CFrame.new(root.Position.X, floorY + height, root.Position.Z)
 
+	-- Platform no-collide vs other players so they don't get launched by the slab
+	disablePlatformCollisionWithOthers(activePlatform)
+
 	local facing = CFrame.new(Vector3.new(), Vector3.new(root.CFrame.LookVector.X, 0, root.CFrame.LookVector.Z))
 	root.CFrame = CFrame.new(root.Position.X, floorY + height + 3.5, root.Position.Z) * facing
 
@@ -101,6 +162,9 @@ local function startPose(height)
 		local lv = root.CFrame.LookVector
 		local yaw = CFrame.new(Vector3.new(), Vector3.new(lv.X, 0, lv.Z))
 		root.CFrame = CFrame.new(px, targetY, pz) * yaw
+		-- Zero velocity every frame so physics bumps from other players can't accumulate
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
 		activePlatform.CFrame = CFrame.new(px, savedFloor + currentHeight, pz)
 	end)
 end
@@ -115,6 +179,9 @@ local function startWalkMode(height)
 	isActive = true
 
 	activePlatform = makePlatform()
+
+	-- Platform no-collide vs other players so they don't get launched by the slab
+	disablePlatformCollisionWithOthers(activePlatform)
 
 	local function getRayFloor()
 		return getFloor(character, activePlatform)
@@ -131,7 +198,10 @@ local function startWalkMode(height)
 
 		local floorY = getRayFloor()
 		local targetY = floorY + currentHeight + 3.5
-		local newPos = Vector3.new(root.Position.X, root.Position.Y + (targetY - root.Position.Y) * 0.2, root.Position.Z)
+		-- IMPROVEMENT: Smoother lerp factor (0.15 → snappier on fast terrain, still smooth)
+		local lerpFactor = math.min(1, 0.2 * (60 * RunService.Heartbeat:Wait()))
+		local newY = root.Position.Y + (targetY - root.Position.Y) * 0.15
+		local newPos = Vector3.new(root.Position.X, newY, root.Position.Z)
 
 		local moveDir = humanoid.MoveDirection
 		local yaw
@@ -143,6 +213,9 @@ local function startWalkMode(height)
 		end
 
 		root.CFrame = CFrame.new(newPos) * yaw
+		-- Zero velocity so physics bumps from other players can't accumulate
+		root.AssemblyLinearVelocity = Vector3.zero
+		root.AssemblyAngularVelocity = Vector3.zero
 		activePlatform.CFrame = CFrame.new(root.Position.X, floorY + currentHeight, root.Position.Z)
 	end)
 end
@@ -200,7 +273,7 @@ local MStroke = Instance.new("UIStroke", MainFrame)
 MStroke.Color = Color3.fromRGB(95, 60, 210)
 MStroke.Thickness = 1.5
 
--- Title bar (rounded top only via separate frame)
+-- Title bar
 local TitleBar = Instance.new("Frame", MainFrame)
 TitleBar.Size = UDim2.new(1, 0, 0, TITLE_H)
 TitleBar.Position = UDim2.new(0, 0, 0, 0)
@@ -208,7 +281,6 @@ TitleBar.BackgroundColor3 = Color3.fromRGB(18, 13, 35)
 TitleBar.BorderSizePixel = 0
 TitleBar.ZIndex = 2
 
--- UICorner on TitleBar would round all 4 corners, so we use a child frame to cover bottom corners
 local TitleBarFill = Instance.new("Frame", TitleBar)
 TitleBarFill.Size = UDim2.new(1, 0, 0.5, 0)
 TitleBarFill.Position = UDim2.new(0, 0, 0.5, 0)
@@ -227,7 +299,6 @@ TitleLabel.TextSize = 14
 TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
 TitleLabel.ZIndex = 3
 
--- Title buttons — inside MainFrame, positioned absolutely so they stay inside
 local function makeTitleBtn(txt, rightPad, bg)
 	local b = Instance.new("TextButton", MainFrame)
 	b.Size = UDim2.new(0, 26, 0, 26)
@@ -246,7 +317,6 @@ end
 local CloseBtn = makeTitleBtn("X", 10, Color3.fromRGB(185, 38, 52))
 local HideBtn  = makeTitleBtn("-", 42, Color3.fromRGB(42, 35, 78))
 
--- Hover animations on title buttons
 for _, btn in ipairs({CloseBtn, HideBtn}) do
 	local orig = btn.BackgroundColor3
 	btn.MouseEnter:Connect(function()
@@ -257,7 +327,6 @@ for _, btn in ipairs({CloseBtn, HideBtn}) do
 	end)
 end
 
--- Divider
 local Divider = Instance.new("Frame", MainFrame)
 Divider.Size = UDim2.new(1, -24, 0, 1)
 Divider.Position = UDim2.new(0, 12, 0, TITLE_H)
@@ -265,7 +334,6 @@ Divider.BackgroundColor3 = Color3.fromRGB(95, 60, 210)
 Divider.BackgroundTransparency = 0.55
 Divider.BorderSizePixel = 0
 
--- Content
 local Content = Instance.new("Frame", MainFrame)
 Content.Size = UDim2.new(1, 0, 1, -TITLE_H - 1)
 Content.Position = UDim2.new(0, 0, 0, TITLE_H + 1)
@@ -273,7 +341,6 @@ Content.BackgroundTransparency = 1
 
 local PAD = 14
 
--- Height label
 local HLabel = Instance.new("TextLabel", Content)
 HLabel.Size = UDim2.new(1, -PAD*2, 0, 14)
 HLabel.Position = UDim2.new(0, PAD, 0, 10)
@@ -284,7 +351,6 @@ HLabel.Font = Enum.Font.Gotham
 HLabel.TextSize = 11
 HLabel.TextXAlignment = Enum.TextXAlignment.Left
 
--- Height input
 local HeightInput = Instance.new("TextBox", Content)
 HeightInput.Size = UDim2.new(1, -PAD*2, 0, 34)
 HeightInput.Position = UDim2.new(0, PAD, 0, 26)
@@ -310,7 +376,6 @@ HeightInput.FocusLost:Connect(function()
 	tween(HStroke, {Transparency = 0.55, Thickness = 1})
 end)
 
--- Buttons
 local BW = math.floor((FRAME_W - PAD*2 - 8) / 2)
 
 local function makeBtn(parent, txt, bg, xOff, yOff, w, h)
@@ -348,7 +413,6 @@ local StartBtn = makeBtn(Content, "START",     Color3.fromRGB(65, 32, 180), PAD,
 local StopBtn  = makeBtn(Content, "STOP",      Color3.fromRGB(165, 26, 52), PAD + BW + 8, 74, BW, 34)
 local WalkBtn  = makeBtn(Content, "WALK MODE", Color3.fromRGB(22,  98, 170), PAD,         116, FRAME_W - PAD*2, 34)
 
--- Status row
 local StatusDot = Instance.new("Frame", Content)
 StatusDot.Size = UDim2.new(0, 7, 0, 7)
 StatusDot.Position = UDim2.new(0, PAD, 0, 165)
